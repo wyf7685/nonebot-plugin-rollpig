@@ -19,8 +19,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "nonebot-adapter-milky>=1.2.0",
     "nonebot-adapter-onebot>=2.4.6",
-    "nonebot2[fastapi]>=2.4.0",
+    "nonebot2[fastapi,httpx,websockets]>=2.4.2",
 ]
 
 [project.urls]
@@ -36,6 +37,9 @@ module-root = ""
 [tool.nonebot.adapters]
 nonebot-adapter-onebot = [
     { name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" },
+]
+nonebot-adapter-milky = [
+    { name = "Milky", module_name = "nonebot.adapters.milky" },
 ]
 [tool.nonebot.plugins]
 nonebot_plugin_rollpig = ["nonebot_plugin_rollpig"]
