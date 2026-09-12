@@ -15,7 +15,7 @@ from typing import Annotated
 
 from nonebot_plugin_uninfo import Uninfo
 from nonebot_plugin_apscheduler import scheduler
-from nonebot_plugin_alconna import Args, Text, Image, Match, Option, Alconna, CustomNode, UniMessage, on_alconna
+from nonebot_plugin_alconna import At, Args, Text, Image, Match, Option, Alconna, CustomNode, UniMessage, on_alconna
 
 from .config import plugin_config
 from .resource_manager import rollpig_resource_manager
@@ -46,7 +46,11 @@ __plugin_meta__ = PluginMetadata(
 )
 
 
-todays_pig = on_alconna(Alconna("今天是什么小猪"), aliases={"今日小猪", "本日小猪", "当日小猪"}, use_cmd_start=True)
+todays_pig = on_alconna(
+    Alconna("今天是什么小猪", Args["target?#目标", At | str]),
+    aliases={"今日小猪", "本日小猪", "当日小猪"},
+    use_cmd_start=True,
+)
 roll_pig = on_alconna(Alconna("随机小猪", Args["count?", Annotated[int, lambda x: 0 < x < 21]]), use_cmd_start=True)
 find_pig = on_alconna(
     Alconna("找猪", Args["keyword?", str], Option("-i|--id|id", Args["id?", int])), aliases={"搜猪"}, use_cmd_start=True
@@ -128,13 +132,18 @@ async def send_rendered_pig(pig_data: Pigsonality):
         },
         avatar_file,
     )
-    await UniMessage.image(raw=render_result.data).finish()
+    await UniMessage.image(raw=render_result.data).finish(reply_to=True)
 
 
 # 命令处理函数
 @todays_pig.handle()
-async def _(user: Uninfo):
-    user_id = str(user.user.id)
+async def _(user: Uninfo, target: Match[At | str]):
+    if target.available:
+        user_id = target.result.target if isinstance(target.result, At) else target.result
+    else:
+        user_id = user.user.id
+
+    user_id = str(user_id)
     try:
         pig = await pigsty.get_or_catch_today_pig(user_id)
     except PigResourceUnavailableError as error:
