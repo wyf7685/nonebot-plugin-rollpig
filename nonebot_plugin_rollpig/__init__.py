@@ -58,7 +58,6 @@ find_pig = on_alconna(
 sync_pig_resources = on_alconna(Alconna("同步小猪资源"), aliases={"刷新小猪图鉴"}, use_cmd_start=True)
 
 driver = get_driver()
-config = plugin_config
 background_resource_sync_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -67,7 +66,7 @@ async def startup():
     # 本地可用资源必须先完成加载；云端检查放到后台，不能拖延 NoneBot 启动。
     await pigsty.load_pigsty()
     pighub_service.schedule_startup_refresh()
-    if config.rollpig_resource_sync_enabled:
+    if plugin_config.rollpig_resource_sync_enabled:
         schedule_background_resource_sync("startup")
 
 
@@ -114,7 +113,7 @@ def schedule_background_resource_sync(source: str) -> None:
 def get_resource_sync_interval_hours() -> int:
     """读取资源同步间隔；非法配置回退到 24 小时，避免定时器导入期失败。"""
     try:
-        return max(1, int(config.rollpig_resource_sync_interval_hours or 24))
+        return max(1, int(plugin_config.rollpig_resource_sync_interval_hours or 24))
     except Exception as error:
         logger.warning(f"rollpig_resource_sync_interval_hours 配置非法，已回退到 24 小时: {error}")
         return 24
@@ -252,6 +251,6 @@ async def refresh_pigsty():
     max_instances=1,
 )
 async def scheduled_sync_pig_resources():
-    if not config.rollpig_resource_sync_enabled:
+    if not plugin_config.rollpig_resource_sync_enabled:
         return
     await run_background_resource_sync("interval")
