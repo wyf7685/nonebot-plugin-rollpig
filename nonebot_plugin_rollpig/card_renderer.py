@@ -62,6 +62,8 @@ PLACEHOLDER_FG = (154, 92, 135, 255)
 PACKAGE_FONT_DIR = Path(__file__).parent / "resource" / "fonts"
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_./:+#@%-]+|[^\S\n]+|\n|.", re.S)
 
+Font = ImageFont.ImageFont | ImageFont.FreeTypeFont
+
 
 @dataclass(frozen=True)
 class PigCardRenderResult:
@@ -79,7 +81,7 @@ class _TextLayout:
     name_line: str
     desc_line: str
     analysis_lines: list[str]
-    analysis_font: ImageFont.ImageFont
+    analysis_font: Font
     analysis_font_size: int
     analysis_line_height: int
     total_height: int
@@ -195,7 +197,7 @@ def _card_render_asset_signature() -> tuple[object, ...]:
 
 
 @lru_cache(maxsize=32)
-def _load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
+def _load_font(size: int, *, bold: bool = False) -> Font:
     """加载指定字号字体；找不到中文字体时降级但不中断渲染。"""
 
     for font_path in _font_candidates(bold=bold):
@@ -213,7 +215,7 @@ def _load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
 # ================================ 文本测量与换行 ================================ #
 
 
-def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: Font) -> int:
     """按实际像素测量文本宽度；Pillow 版本差异导致 textlength 失败时回退 bbox。"""
 
     if not text:
@@ -222,17 +224,16 @@ def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFon
         return int(draw.textlength(text, font=font))
     except Exception:
         bbox = draw.textbbox((0, 0), text, font=font)
-        return max(0, bbox[2] - bbox[0])
+        return int(max(0, bbox[2] - bbox[0]))
 
 
-def _font_line_top(font: ImageFont.ImageFont, y: int, line_height: int) -> int:
+def _font_line_top(font: Font, y: int, line_height: int) -> int:
     """按字体整体指标定位行顶，避免每行内容 bbox 不同造成视觉行距漂移。"""
 
-    try:
+    if isinstance(font, ImageFont.FreeTypeFont):
         ascent, descent = font.getmetrics()
         font_height = ascent + descent
-    except Exception:
-        # Pillow 默认字体等少数对象没有 getmetrics，用固定中英文样本估算稳定高度。
+    else:
         mask = font.getmask("国Hg")
         bbox = mask.getbbox() or (0, 0, 1, line_height)
         font_height = max(1, bbox[3] - bbox[1])
@@ -253,7 +254,7 @@ def _drop_last_text_unit(text: str) -> str:
 def _truncate_to_width(
     draw: ImageDraw.ImageDraw,
     text: str,
-    font: ImageFont.ImageFont,
+    font: Font,
     max_width: int,
 ) -> str:
     """把单行文本收敛到给定宽度，末尾使用中文省略号。"""
@@ -271,7 +272,7 @@ def _truncate_to_width(
 def _append_ellipsis_to_width(
     draw: ImageDraw.ImageDraw,
     text: str,
-    font: ImageFont.ImageFont,
+    font: Font,
     max_width: int,
 ) -> str:
     """强制给截断行追加省略号，并保证追加后仍不超出最大宽度。"""
@@ -286,7 +287,7 @@ def _append_ellipsis_to_width(
 def _wrap_text_by_width(
     draw: ImageDraw.ImageDraw,
     text: str,
-    font: ImageFont.ImageFont,
+    font: Font,
     max_width: int,
     *,
     max_lines: int | None = None,
@@ -380,7 +381,7 @@ def _normalize_gif_duration(raw_duration: object) -> int:
     """规整 GIF 帧间隔；防御 0ms/异常值让客户端播放过快或卡住。"""
 
     try:
-        duration = int(raw_duration)
+        duration = int(raw_duration)  # pyright: ignore[reportArgumentType]
     except (TypeError, ValueError):
         duration = GIF_FALLBACK_FRAME_DURATION_MS
     if duration <= 0:
@@ -571,8 +572,7 @@ def _store_fixed_card(key: tuple[object, ...], result: PigCardRenderResult) -> b
     payload = _serialize_card_disk_cache(result)
     if len(payload) > CARD_DISK_CACHE_MAX_BYTES:
         logger.warning(
-            "RollPig 卡片成品超过磁盘缓存总上限，本次不缓存: "
-            f"bytes={len(payload)}/{CARD_DISK_CACHE_MAX_BYTES}"
+            f"RollPig 卡片成品超过磁盘缓存总上限，本次不缓存: bytes={len(payload)}/{CARD_DISK_CACHE_MAX_BYTES}"
         )
         return False
 
@@ -667,8 +667,7 @@ def _load_animated_avatar_frames(image_file: Path | None) -> tuple[tuple[Image.I
                 raise ValueError(f"GIF 抽样帧数量异常: decoded={len(decoded)}, expected={len(groups)}")
             if frame_count > len(groups):
                 logger.info(
-                    f"RollPig GIF 已在完整周期内均匀抽帧: "
-                    f"file={image_file}, frames={frame_count}->{len(groups)}"
+                    f"RollPig GIF 已在完整周期内均匀抽帧: file={image_file}, frames={frame_count}->{len(groups)}"
                 )
             return tuple(zip(decoded, durations))
     except Exception as error:
@@ -742,9 +741,7 @@ def _build_text_layout(
     available_height = max(analysis_line_height, CONTENT_SAFE_HEIGHT - static_height)
     max_lines = max(1, available_height // analysis_line_height)
     analysis_lines = (
-        _wrap_text_by_width(draw, analysis, analysis_font, CONTENT_WIDTH, max_lines=max_lines)
-        if analysis
-        else []
+        _wrap_text_by_width(draw, analysis, analysis_font, CONTENT_WIDTH, max_lines=max_lines) if analysis else []
     )
     total_height = static_height + len(analysis_lines) * analysis_line_height
     return _TextLayout(
@@ -764,7 +761,7 @@ def _build_text_layout(
 def _draw_text_line(
     canvas: Image.Image,
     text: str,
-    font: ImageFont.ImageFont,
+    font: Font,
     y: int,
     line_height: int,
     fill: tuple[int, int, int, int],
@@ -981,11 +978,7 @@ def _render_pig_card_image_sync(
     avatar_frames: tuple[tuple[Image.Image, int], ...] = ()
     try:
         avatar_frames = _load_animated_avatar_frames(image_file)
-        result = (
-            _encode_gif_card(prepared, avatar_frames)
-            if avatar_frames
-            else _encode_png_card(prepared, image_file)
-        )
+        result = _encode_gif_card(prepared, avatar_frames) if avatar_frames else _encode_png_card(prepared, image_file)
     finally:
         prepared.canvas.close()
         for frame, _ in avatar_frames:
