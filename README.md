@@ -94,6 +94,8 @@ ROLLPIG_RESOURCE_SYNC_ENABLED=false
 如需使用自己的资源站点，可将 `ROLLPIG_RESOURCE_MANIFEST_URL` 改为自己的 `manifest.json` 地址。
 同步后的资源会缓存到本地，运行时优先使用本地缓存。新资源只有在 `pig.json` 非空、字段完整且每只猪都有对应图片时才会激活；云端不可用或资源校验失败时，会继续使用当前缓存或回退到插件内置资源。
 
+资源 manifest 的 `pig_json` 与每个 `images` 条目都必须提供准确的 `size` 和 SHA-256 `sha256`。插件会在传输资源文件前校验整个包的声明大小；资源版本变化时，已缓存且哈希一致的文件会直接复用，只下载新增或内容变化的文件。
+
 如需同时追加多个私有资源包，可在 `.env` 中填写单行 JSON：
 
 ```env

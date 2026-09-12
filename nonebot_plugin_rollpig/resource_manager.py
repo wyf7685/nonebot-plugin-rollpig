@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import time
@@ -28,6 +29,7 @@ PRIVATE_RESOURCE_ROOT = CACHE_ROOT / "private_overlays"
 
 PIG_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 PRIVATE_SOURCE_NAME_PATTERN = re.compile(r"[^a-z0-9_-]+")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 # GIF 优先于同名静态图，允许资源包把某只猪替换为动态版本而不改 pig.json。
 IMAGE_SUFFIX_PRIORITY = (".gif", ".png", ".jpg", ".jpeg", ".webp")
 ALLOWED_IMAGE_SUFFIXES = set(IMAGE_SUFFIX_PRIORITY)
@@ -57,20 +59,30 @@ class ResourceSyncResult:
 
 @dataclass
 class _DownloadBudget:
-    """限制单次资源同步的总文件数和总字节数，避免异常 manifest 拖垮磁盘。"""
+    """Reserve package limits before any resource file is transferred."""
 
     max_total_size: int
     max_file_count: int
     total_size: int = 0
     file_count: int = 0
 
-    def add_file(self, *, path: str, size: int) -> None:
-        self.file_count += 1
-        self.total_size += size
-        if self.file_count > self.max_file_count:
-            raise ValueError(f"资源包文件数量超过上限: {self.file_count}/{self.max_file_count}")
-        if self.total_size > self.max_total_size:
+    def reserve_file(self, *, path: str, size: int) -> None:
+        file_count = self.file_count + 1
+        total_size = self.total_size + size
+        if file_count > self.max_file_count:
+            raise ValueError(f"资源包文件数量超过上限: {file_count}/{self.max_file_count}")
+        if total_size > self.max_total_size:
             raise ValueError(f"资源包总大小超过上限: {path}")
+        self.file_count = file_count
+        self.total_size = total_size
+
+
+@dataclass(frozen=True)
+class _ResourceFileSpec:
+    source_path: str
+    target_path: Path
+    size: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -409,6 +421,7 @@ class RollPigResourceManager:
                     manifest=manifest,
                     staging_dir=staging_dir,
                     max_size=max_size,
+                    reuse_dirs=(ACTIVE_RESOURCE_DIR, CACHE_ROOT / "previous", BUILTIN_RESOURCE_DIR),
                 )
                 self._activate_staging(staging_dir, manifest=manifest, resource_version=resource_version)
             finally:
@@ -493,6 +506,7 @@ class RollPigResourceManager:
                     manifest=manifest,
                     staging_dir=staging_dir,
                     max_size=max_size,
+                    reuse_dirs=(source.active_dir, source.previous_dir),
                 )
                 self._validate_private_staging_snapshot(source, staging_dir)
                 self._activate_private_staging(
@@ -549,42 +563,109 @@ class RollPigResourceManager:
         manifest: dict[str, Any],
         staging_dir: Path,
         max_size: int,
+        reuse_dirs: tuple[Path, ...],
     ) -> None:
+        pig_json_spec, image_specs = self._build_download_plan(manifest, max_size=max_size)
+        reused_count = 0
+        downloaded_count = 0
+
+        if await self._download_file(
+            client,
+            manifest_url=manifest_url,
+            spec=pig_json_spec,
+            target=staging_dir / pig_json_spec.target_path,
+            reuse_dirs=reuse_dirs,
+        ):
+            reused_count += 1
+        else:
+            downloaded_count += 1
+        pig_list = self._validate_pig_json(staging_dir / pig_json_spec.target_path)
+
+        for spec in image_specs:
+            if await self._download_file(
+                client,
+                manifest_url=manifest_url,
+                spec=spec,
+                target=staging_dir / spec.target_path,
+                reuse_dirs=reuse_dirs,
+            ):
+                reused_count += 1
+            else:
+                downloaded_count += 1
+
+        self._ensure_images_exist(pig_list, [staging_dir / "images"])
+        logger.info(f"rollpig 资源文件已准备: reused={reused_count}, downloaded={downloaded_count}")
+
+    def _build_download_plan(
+        self,
+        manifest: dict[str, Any],
+        *,
+        max_size: int,
+    ) -> tuple[_ResourceFileSpec, list[_ResourceFileSpec]]:
+        """Validate every file and reserve the full package budget before transfer."""
+
         pig_json_meta = manifest.get("pig_json")
         if not isinstance(pig_json_meta, dict):
             raise ValueError("manifest 缺少 pig_json")
-        budget = _DownloadBudget(max_total_size=RESOURCE_PACKAGE_MAX_SIZE, max_file_count=RESOURCE_MAX_FILES)
-        await self._download_file(
-            client,
-            manifest_url=manifest_url,
-            meta=pig_json_meta,
-            target=staging_dir / "pig.json",
-            max_size=min(max_size, RESOURCE_PIG_JSON_MAX_SIZE),
-            budget=budget,
-        )
-        pig_list = self._validate_pig_json(staging_dir / "pig.json")
 
         image_items = manifest.get("images")
         if not isinstance(image_items, list):
             raise ValueError("manifest 缺少 images 列表")
         if len(image_items) > RESOURCE_MAX_IMAGES:
             raise ValueError(f"manifest images 数量超过上限: {len(image_items)}/{RESOURCE_MAX_IMAGES}")
-        image_dir = staging_dir / "images"
-        image_dir.mkdir(parents=True, exist_ok=True)
+
+        budget = _DownloadBudget(max_total_size=RESOURCE_PACKAGE_MAX_SIZE, max_file_count=RESOURCE_MAX_FILES)
+        pig_json_spec = self._parse_resource_file_spec(
+            pig_json_meta,
+            target_path=Path("pig.json"),
+            max_size=min(max_size, RESOURCE_PIG_JSON_MAX_SIZE),
+        )
+        budget.reserve_file(path=pig_json_spec.source_path, size=pig_json_spec.size)
+
+        image_specs: list[_ResourceFileSpec] = []
+        seen_targets: set[Path] = set()
         for item in image_items:
             if not isinstance(item, dict):
                 raise ValueError("manifest images 存在非法条目")
             filename = str(item.get("filename") or Path(str(item.get("path") or "")).name)
             self._validate_image_filename(filename)
-            await self._download_file(
-                client,
-                manifest_url=manifest_url,
-                meta=item,
-                target=image_dir / filename,
-                max_size=max_size,
-                budget=budget,
-            )
-        self._ensure_images_exist(pig_list, [image_dir])
+            target_path = Path("images") / filename
+            if target_path in seen_targets:
+                raise ValueError(f"manifest images 存在重复文件名: {filename}")
+            seen_targets.add(target_path)
+            spec = self._parse_resource_file_spec(item, target_path=target_path, max_size=max_size)
+            budget.reserve_file(path=spec.source_path, size=spec.size)
+            image_specs.append(spec)
+
+        return pig_json_spec, image_specs
+
+    def _parse_resource_file_spec(
+        self,
+        meta: dict[str, Any],
+        *,
+        target_path: Path,
+        max_size: int,
+    ) -> _ResourceFileSpec:
+        path = str(meta.get("path") or meta.get("filename") or "").strip()
+        if not path:
+            raise ValueError("manifest 文件条目缺少 path")
+        self._validate_manifest_path(path)
+
+        raw_size = meta.get("size")
+        try:
+            size = int(raw_size)  # pyright: ignore[reportArgumentType]
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"资源文件缺少有效 size: {path}") from error
+        if isinstance(raw_size, bool) or size <= 0:
+            raise ValueError(f"资源文件缺少有效 size: {path}")
+        if size > max_size:
+            raise ValueError(f"资源文件超过大小上限: {path}")
+
+        sha256 = str(meta.get("sha256") or "").strip().lower()
+        if not SHA256_PATTERN.fullmatch(sha256):
+            raise ValueError(f"资源文件缺少有效 sha256: {path}")
+
+        return _ResourceFileSpec(source_path=path, target_path=target_path, size=size, sha256=sha256)
 
     async def _download_json(self, client: httpx.AsyncClient, url: str, *, max_size: int) -> dict[str, Any]:
         content = await self._download_bytes(client, url, max_size=max_size)
@@ -598,38 +679,82 @@ class RollPigResourceManager:
         client: httpx.AsyncClient,
         *,
         manifest_url: str,
-        meta: dict[str, Any],
+        spec: _ResourceFileSpec,
         target: Path,
-        max_size: int,
-        budget: _DownloadBudget,
-    ) -> None:
-        path = str(meta.get("path") or meta.get("filename") or "").strip()
-        if not path:
-            raise ValueError("manifest 文件条目缺少 path")
-        self._validate_manifest_path(path)
-
-        expected_size_raw = meta.get("size")
-        expected_size = int(expected_size_raw) if expected_size_raw is not None else 0
-        if expected_size and expected_size > max_size:
-            raise ValueError(f"资源文件超过大小上限: {path}")
+        reuse_dirs: tuple[Path, ...],
+    ) -> bool:
+        if await self._reuse_existing_file(spec, target=target, reuse_dirs=reuse_dirs):
+            return True
 
         size, actual_sha256, tmp = await self._copy_manifest_file_to_temp(
             client,
             manifest_url=manifest_url,
-            path=path,
+            path=spec.source_path,
             target=target,
-            max_size=max_size,
+            max_size=spec.size,
         )
         try:
-            if expected_size and size != expected_size:
-                raise ValueError(f"资源文件大小不匹配: {path}")
-            expected_sha256 = str(meta.get("sha256") or "").lower()
-            if expected_sha256 and actual_sha256 != expected_sha256:
-                raise ValueError(f"资源文件 sha256 不匹配: {path}")
-            budget.add_file(path=path, size=size)
+            if size != spec.size:
+                raise ValueError(f"资源文件大小不匹配: {spec.source_path}")
+            if actual_sha256 != spec.sha256:
+                raise ValueError(f"资源文件 sha256 不匹配: {spec.source_path}")
+            await asyncio.to_thread(tmp.replace, target)
+        finally:
+            await asyncio.to_thread(tmp.unlink, missing_ok=True)
+        return False
+
+    async def _reuse_existing_file(
+        self,
+        spec: _ResourceFileSpec,
+        *,
+        target: Path,
+        reuse_dirs: tuple[Path, ...],
+    ) -> bool:
+        for reuse_dir in reuse_dirs:
+            source = reuse_dir / spec.target_path
+            if await asyncio.to_thread(
+                self._reuse_existing_file_sync,
+                source,
+                target,
+                spec.size,
+                spec.sha256,
+            ):
+                return True
+        return False
+
+    def _reuse_existing_file_sync(
+        self,
+        source: Path,
+        target: Path,
+        expected_size: int,
+        expected_sha256: str,
+    ) -> bool:
+        try:
+            if not source.is_file() or source.stat().st_size != expected_size:
+                return False
+            if self._sha256_file_sync(source) != expected_sha256:
+                return False
+        except OSError:
+            return False
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            try:
+                os.link(source, tmp)
+            except OSError:
+                shutil.copyfile(source, tmp)
             tmp.replace(target)
+            return True
         finally:
             tmp.unlink(missing_ok=True)
+
+    def _sha256_file_sync(self, path: Path) -> str:
+        hasher = hashlib.sha256()
+        with path.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
 
     async def _download_bytes(self, client: httpx.AsyncClient, url: str, *, max_size: int) -> bytes:
         """流式读取小型 JSON，避免异常响应一次性进入内存。"""
@@ -731,9 +856,9 @@ class RollPigResourceManager:
         *,
         max_size: int,
     ) -> tuple[int, str, Path]:
-        """流式下载到临时文件；校验通过前绝不覆盖目标文件。"""
+        """Stream a remote file while dispatching every filesystem write to a worker thread."""
 
-        target.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
         tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
         total = 0
         hasher = hashlib.sha256()
@@ -741,16 +866,19 @@ class RollPigResourceManager:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
                 self._validate_content_length(response.headers.get("Content-Length"), max_size=max_size, label=url)
-                with tmp.open("wb") as file:
+                file = await asyncio.to_thread(tmp.open, "wb")
+                try:
                     async for chunk in response.aiter_bytes():
                         total += len(chunk)
                         if total > max_size:
                             raise ValueError(f"文件超过大小上限: {url}")
                         hasher.update(chunk)
-                        file.write(chunk)
+                        await asyncio.to_thread(file.write, chunk)
+                finally:
+                    await asyncio.to_thread(file.close)
             return total, hasher.hexdigest(), tmp
-        except Exception:
-            tmp.unlink(missing_ok=True)
+        except BaseException:
+            await asyncio.to_thread(tmp.unlink, missing_ok=True)
             raise
 
     def _activate_staging(self, staging_dir: Path, *, manifest: dict[str, Any], resource_version: str) -> None:
