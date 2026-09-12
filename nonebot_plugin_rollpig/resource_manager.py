@@ -40,6 +40,9 @@ RESOURCE_MAX_IMAGES = 500
 RESOURCE_MAX_FILES = 700
 RESOURCE_SYNC_TIMEOUT_MIN_SECONDS = 1.0
 RESOURCE_SYNC_TIMEOUT_MAX_SECONDS = 240.0
+RESOURCE_SYNC_CONCURRENCY_DEFAULT = 4
+RESOURCE_SYNC_CONCURRENCY_MIN = 1
+RESOURCE_SYNC_CONCURRENCY_MAX = 32
 
 
 def _resource_sync_timeout() -> float:
@@ -47,6 +50,17 @@ def _resource_sync_timeout() -> float:
 
     configured = float(plugin_config.rollpig_resource_sync_timeout)
     return min(RESOURCE_SYNC_TIMEOUT_MAX_SECONDS, max(RESOURCE_SYNC_TIMEOUT_MIN_SECONDS, configured))
+
+
+def _resource_sync_concurrency() -> int:
+    """返回有效的文件准备并发数，避免误配置耗尽连接和工作线程。"""
+
+    try:
+        configured = int(plugin_config.rollpig_resource_sync_concurrency)
+    except (TypeError, ValueError) as error:
+        logger.warning(f"rollpig_resource_sync_concurrency 配置非法，已回退到默认值: {error}")
+        return RESOURCE_SYNC_CONCURRENCY_DEFAULT
+    return min(RESOURCE_SYNC_CONCURRENCY_MAX, max(RESOURCE_SYNC_CONCURRENCY_MIN, configured))
 
 
 @dataclass
@@ -566,35 +580,59 @@ class RollPigResourceManager:
         reuse_dirs: tuple[Path, ...],
     ) -> None:
         pig_json_spec, image_specs = self._build_download_plan(manifest, max_size=max_size)
-        reused_count = 0
-        downloaded_count = 0
+        file_specs = (pig_json_spec, *image_specs)
+        worker_count = min(_resource_sync_concurrency(), len(file_specs))
+        file_queue: asyncio.Queue[tuple[int, _ResourceFileSpec]] = asyncio.Queue()
+        for item in enumerate(file_specs):
+            file_queue.put_nowait(item)
 
-        if await self._download_file(
-            client,
-            manifest_url=manifest_url,
-            spec=pig_json_spec,
-            target=staging_dir / pig_json_spec.target_path,
-            reuse_dirs=reuse_dirs,
-        ):
-            reused_count += 1
-        else:
-            downloaded_count += 1
+        results: list[bool | Exception | None] = [None] * len(file_specs)
+
+        async def worker() -> None:
+            while True:
+                try:
+                    index, spec = file_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+                try:
+                    results[index] = await self._download_file(
+                        client,
+                        manifest_url=manifest_url,
+                        spec=spec,
+                        target=staging_dir / spec.target_path,
+                        reuse_dirs=reuse_dirs,
+                    )
+                except Exception as error:
+                    results[index] = error
+                finally:
+                    file_queue.task_done()
+
+        workers = [
+            asyncio.create_task(worker(), name=f"rollpig-resource-worker-{index}") for index in range(worker_count)
+        ]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            for worker_task in workers:
+                worker_task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+
+        for result in results:
+            if result is None:
+                raise RuntimeError("资源文件准备队列未完整处理")
+            if isinstance(result, Exception):
+                raise result
+
         pig_list = self._validate_pig_json(staging_dir / pig_json_spec.target_path)
-
-        for spec in image_specs:
-            if await self._download_file(
-                client,
-                manifest_url=manifest_url,
-                spec=spec,
-                target=staging_dir / spec.target_path,
-                reuse_dirs=reuse_dirs,
-            ):
-                reused_count += 1
-            else:
-                downloaded_count += 1
-
         self._ensure_images_exist(pig_list, [staging_dir / "images"])
-        logger.info(f"rollpig 资源文件已准备: reused={reused_count}, downloaded={downloaded_count}")
+
+        reused_count = sum(result is True for result in results)
+        downloaded_count = len(results) - reused_count
+        logger.info(
+            f"rollpig 资源文件已准备: reused={reused_count}, downloaded={downloaded_count}, concurrency={worker_count}"
+        )
 
     def _build_download_plan(
         self,

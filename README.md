@@ -75,6 +75,9 @@ ROLLPIG_RESOURCE_SYNC_INTERVAL_HOURS=24
 # 单次同步 HTTP 超时时间，单位：秒；运行时限制为 1～240
 ROLLPIG_RESOURCE_SYNC_TIMEOUT=10.0
 
+# 单个资源包同时准备或下载的文件数；运行时限制为 1～32
+ROLLPIG_RESOURCE_SYNC_CONCURRENCY=4
+
 # 单个资源文件大小上限，默认 10 MiB
 ROLLPIG_RESOURCE_MAX_FILE_SIZE=10485760
 
@@ -95,6 +98,8 @@ ROLLPIG_RESOURCE_SYNC_ENABLED=false
 同步后的资源会缓存到本地，运行时优先使用本地缓存。新资源只有在 `pig.json` 非空、字段完整且每只猪都有对应图片时才会激活；云端不可用或资源校验失败时，会继续使用当前缓存或回退到插件内置资源。
 
 资源 manifest 的 `pig_json` 与每个 `images` 条目都必须提供准确的 `size` 和 SHA-256 `sha256`。插件会在传输资源文件前校验整个包的声明大小；资源版本变化时，已缓存且哈希一致的文件会直接复用，只下载新增或内容变化的文件。
+
+并发限制同时作用于缓存校验、文件复用和远端下载。单个资源包内的文件会并发准备，公有资源包与各私有 overlay 仍按配置顺序处理。
 
 如需同时追加多个私有资源包，可在 `.env` 中填写单行 JSON：
 

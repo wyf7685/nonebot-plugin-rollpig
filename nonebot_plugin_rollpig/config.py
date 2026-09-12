@@ -22,11 +22,12 @@ class Config(BaseModel):
     rollpig_resource_manifest_url: str = "https://pig.felislab.cc/resources/rollpig/manifest.json"
     rollpig_resource_sync_interval_hours: int = 24
     rollpig_resource_sync_timeout: float = 10.0  # 运行时限制为 1～240 秒
+    rollpig_resource_sync_concurrency: int = 4  # 运行时限制为 1～32
     rollpig_resource_max_file_size: int = 10 * 1024 * 1024
     # .env 中可写 JSON 数组；保留 str 类型是为了由资源管理器统一解析复杂环境变量。
-    rollpig_private_resource_manifests: (
-        list[PrivateResourceManifestConfig | str | dict[str, Any]] | str
-    ) = Field(default_factory=list)
+    rollpig_private_resource_manifests: list[PrivateResourceManifestConfig | str | dict[str, Any]] | str = Field(
+        default_factory=list
+    )
     # 今日小猪 Pillow 卡片字体；留空时使用插件内置 Source Han Sans SC Medium。
     # 相对路径按 Bot 工作目录解析，方便 Docker 用户挂载自己的字体文件。
     rollpig_card_font_path: str | None = None
